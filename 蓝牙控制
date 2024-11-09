@@ -1,0 +1,85 @@
+#include <Wire.h>
+#include <Adafruit_SSD1306.h>
+#include "BluetoothSerial.h"
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+#define SCREEN_ADDRESS 0x3C  // 通常为 0x3C 或 0x3D
+
+// 引脚定义
+const int relay1 = 12;
+const int relay2 = 14;
+const int sda = 3;
+const int scl = 1;
+
+// 初始化蓝牙串口
+BluetoothSerial SerialBT;
+
+// 初始化OLED屏幕
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// 开关状态
+bool switch1State = false;
+bool switch2State = false;
+
+void setup() {
+  // 设置引脚模式
+  pinMode(relay1, OUTPUT);
+  pinMode(relay2, OUTPUT);
+
+  // 初始化蓝牙
+  SerialBT.begin("esp32");
+
+  // 设置I2C引脚
+  Wire.begin(sda, scl);
+
+  // 初始化OLED屏幕
+  if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for (;;) ; // 不继续执行，无限循环
+  }
+  display.display();
+  delay(2000); // 暂停2秒
+  display.clearDisplay();
+
+  // 显示初始状态
+  updateDisplay();
+}
+
+void loop() {
+  // 检查是否有数据从蓝牙接收
+  if (SerialBT.available()) {
+    char receivedChar = SerialBT.read();
+    
+    // 根据接收的字符改变继电器状态
+    switch (receivedChar) {
+      case '1':
+        switch1State = !switch1State;
+        digitalWrite(relay1, switch1State ? HIGH : LOW);
+        break;
+      case '2':
+        switch2State = !switch2State;
+        digitalWrite(relay2, switch2State ? HIGH : LOW);
+        break;
+    }
+    // 更新显示
+    updateDisplay();
+  }
+}
+
+void updateDisplay() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  
+  display.print("Relay 1: ");
+  display.print(switch1State ? "ON" : "OFF");
+  
+  display.setCursor(0, 10);
+  display.print("Relay 2: ");
+  display.print(switch2State ? "ON" : "OFF");
+  
+  display.display();
+}
