@@ -1,0 +1,366 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <Adafruit_SSD1306.h>
+#include <ESPmDNS.h>
+#include <WiFiManager.h>
+
+// 定义 9 个输出控制的引脚
+const int outputPins[] = {16, 17, 18, 19, 21, 22, 23, 32, 33};
+// 最大 WiFi 连接尝试次数（可根据实际情况调整）
+const int maxWiFiConnectAttempts = 5;
+// 用于记录当前的自锁状态，true 为开启，false 为关闭
+bool selfLockState = false;
+WebServer server(80);
+// 管理员用户名和密码
+const char* adminUsername = "admin";
+const char* adminPassword = "password";
+// OLED 显示屏相关定义
+Adafruit_SSD1306 display(128, 64, &Wire, -1);
+// 用于记录是否通过局域网控制了输出引脚电平
+bool isLanControlled = false;
+// 记录上一次的输出状态和 IP 地址
+String lastOutputStates[9];
+String lastIPAddress = "";
+// 存储 IP 地址的字符串
+String ipAddressString;
+// 当前显示的页面
+int currentPage = 0;
+const int totalPages = 2;
+// 上次翻页的时间
+unsigned long lastPageFlipTime = 0;
+const unsigned long pageFlipInterval = 5000; // 每 5 秒翻页一次
+// 用于 OLED 显示屏更新计数
+int displayUpdateCounter = 0;
+const int displayUpdateInterval = 10; // 每 10 次循环更新一次显示屏
+// 用于记录是否已登录
+bool isLoggedIn = false;
+
+// 定义用于清除配置的触发引脚，这里为14引脚，可按实际调整
+const int clearConfigButtonPin = 14;
+// 用于记录引脚的当前状态
+int buttonState;
+// 用于记录上一次引脚的状态，用于防抖判断
+int lastButtonState = HIGH;
+
+void setup() {
+    // 初始化串口通信，波特率可根据需要设置
+    Serial.begin(115200);
+
+    // 设置 9 个输出引脚为输出模式
+    for (int i = 0; i < 9; i++) {
+        pinMode(outputPins[i], OUTPUT);
+        digitalWrite(outputPins[i], LOW);
+        lastOutputStates[i] = "Output: OFF"; // 初始状态
+    }
+
+    // 初始化用于清除配置触发引脚为输入模式，并启用内部上拉电阻（可根据实际情况调整，如果外部有上拉电阻可改为INPUT）
+    pinMode(clearConfigButtonPin, INPUT_PULLUP);
+
+    // 初始化WiFiManager
+    WiFiManager wm;
+
+    // 尝试自动连接，如果失败则进入配置模式
+    if (!wm.autoConnect("AutoConnectAP")) {
+        Serial.println("Failed to connect and hit timeout");
+        // 在这里可以添加更多错误处理逻辑，比如重启设备等
+        delay(3000);
+        ESP.restart();
+    }
+
+    // 连接成功后，获取并打印IP地址
+    Serial.println("WiFi connected");
+    ipAddressString = "IP: " + WiFi.localIP().toString();
+    Serial.println(ipAddressString);
+
+    // 初始化 OLED 显示屏
+    Wire.begin(1, 3);
+    if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+        Serial.println("OLED display initialization failed!");
+        // 尝试重新初始化，可设置重试次数等
+        for (int i = 0; i < 3; i++) {
+            delay(1000);
+            if (display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+                Serial.println("OLED display successfully reinitialized!");
+                break;
+            }
+        }
+        if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+            Serial.println("Failed to reinitialize OLED display. Please check connections.");
+            while (1);
+        }
+    }
+    display.setTextSize(1);
+    display.setTextColor(WHITE);
+    display.setCursor(0, 0);
+    display.println("Loading");
+    display.display();
+    delay(2000); // 暂停2秒
+    display.clearDisplay();
+
+    // 启动 Web 服务器
+    server.begin();
+
+    // 设置控制路由
+    for (int i = 0; i < 9; i++) {
+        String route = "/control" + String(i);
+        server.on(route.c_str(), [i]() {
+            handleControl(i);
+        });
+    }
+    server.on("/", handleRoot);
+    server.on("/login", handleLogin);
+
+    // 初始化 mDNS 服务（可选，如果需要通过设备名称访问网页服务器）
+    if (!MDNS.begin("esp32-device")) {
+        Serial.println("Error setting up MDNS responder!");
+        while (1) {
+            delay(1000);
+        }
+    }
+    MDNS.addService("http", "tcp", 80);
+}
+
+void handleControl(int pinIndex) {
+    if (!isLoggedIn) {
+        server.send(401, "text/plain", "未经授权");
+        return;
+    }
+    if (server.hasArg("state")) {
+        String state = server.arg("state");
+        if (state == "high") {
+            digitalWrite(outputPins[pinIndex], HIGH);
+            isLanControlled = true;
+            selfLockState = false;
+            lastOutputStates[pinIndex] = "Output: ON"; // 更新状态
+            Serial.printf("引脚 %d 设置为高电平\n", pinIndex); // 调试信息
+        } else if (state == "low") {
+            digitalWrite(outputPins[pinIndex], LOW);
+            isLanControlled = true;
+            selfLockState = true;
+            lastOutputStates[pinIndex] = "Output: OFF"; // 更新状态
+            Serial.printf("引脚 %d 设置为低电平\n", pinIndex); // 调试信息
+        }
+    }
+    server.send(200, "text/plain", "输出状态已设置");
+}
+
+void handleRoot() {
+    if (!isLoggedIn) {
+        server.sendHeader("Location", "/login");
+        server.send(302, "text/plain", "");
+        return;
+    }
+    String html = "<html><head><title>继电器控制</title>"
+                  "<meta charset=\"UTF-8\">"  // 明确指定字符编码为UTF-8，避免中文乱码
+                  "<style>"
+                  "body {"
+                  "  background-color: #4CAF50; /* 设置背景色为绿色，和开关背景色一致，可根据喜好调整 */"
+                  "  color: white;"
+                  "  font-family: Arial, sans-serif;"
+                  "  text-align: center;"
+                  "}"
+                  "form {"
+                  "  margin: 20px 0;"
+                  "}"
+                  "button {"
+                  "  background-color: #008000; /* 设置按钮（开关）背景色为绿色 */"
+                  "  color: white;"
+                  "  padding: 10px 20px;"
+                  "  border: none;"
+                  "  border-radius: 5px;"
+                  "}"
+                  "button:hover {"
+                  "  background-color: #006400; /* 按钮悬停时的背景色 */"
+                  "}"
+                  "</style>"
+                  "</head><body>";
+    html += "<h1>继电器控制</h1>";
+    html += "<p>IP地址: " + WiFi.localIP().toString() + "</p>";
+    for (int i = 0; i < 9; i++) {
+        html += "<p>";
+        html += "<form action='/control" + String(i) + "' method='get'>";
+        html += "<button type='submit' name='state' value='high'>打开继电器 " + String(i + 1) + "</button>";
+        html += "&nbsp;";
+        html += "<button type='submit' name='state' value='low'>关闭继电器 " + String(i + 1) + "</button>";
+        html += "</form>";
+        html += "</p>";
+    }
+    html += "</body></html>";
+    server.send(200, "text/html; charset=UTF-8", html);  // 发送时也指定UTF-8编码
+}
+
+void handleLogin() {
+    if (server.hasArg("username") && server.hasArg("password")) {
+        String username = server.arg("username");
+        String password = server.arg("password");
+        if (username == adminUsername && password == adminPassword) {
+            isLoggedIn = true;
+            server.sendHeader("Location", "/");
+            server.send(302, "text/plain", "");
+        } else {
+            server.send(401, "text/html", "<html><head><title>登录</title>"
+                                         "<meta charset=\"UTF-8\">"  // 明确指定字符编码为UTF-8
+                                         "<style>"
+                                         "body {"
+                                         "  background-color: #0077B6; /* 设置登录页面背景色为蓝色 */"
+                                         "  color: white;"
+                                         "  font-family: Arial, sans-serif;"
+                                         "  text-align: center;"
+                                         "}"
+                                         "form {"
+                                         "  margin: 20px 0;"
+                                         "}"
+                                         "input {"
+                                         "  padding: 10px;"
+                                         "  margin: 10px;"
+                                         "}"
+                                         "button {"
+                                         "  background-color: #005f73; /* 登录按钮背景色，可根据喜好调整 */"
+                                         "  color: white;"
+                                         "  padding: 10px 20px;"
+                                         "  border: none;"
+                                         "  border-radius: 5px;"
+                                         "}"
+                                         "button:hover {"
+                                         "  background-color: #004B63; /* 登录按钮悬停时背景色 */"
+                                         "}"
+                                         "</style>"
+                                         "</head><body><h1>登录失败</h1><p>用户名或密码无效。</p><a href=\"/login\">重试</a></body></html>");
+        }
+    } else {
+        String loginForm = "<html><head><title>登录</title>"
+                           "<meta charset=\"UTF-8\">"  // 明确指定字符编码为UTF-8
+                           "<style>"
+                           "body {"
+                           "  background-color: #0077B6; /* 设置登录页面背景色为蓝色 */"
+                           "  color: white;"
+                           "  font-family: Arial, sans-serif;"
+                           "  text-align: center;"
+                           "}"
+                           "form {"
+                           "  margin: 20px 0;"
+                           "}"
+                           "input {"
+                           "  padding: 10px;"
+                           "  margin: 10px;"
+                           "}"
+                           "button {"
+                           "  background-color: #005f73; /* 登录按钮背景色，可根据喜好调整 */"
+                           "  color: white;"
+                           "  padding: 10px 20px;"
+                           "  border: none;"
+                           "  border-radius: 5px;"
+                           "}"
+                           "button:hover {"
+                           "  background-color: #004B63; /* 登录按钮悬停时背景色 */"
+                           "}"
+                           "</style>"
+                           "</head><body>";
+        loginForm += "<h1>登录</h1>";
+        loginForm += "<form action='/login' method='get'>";
+        loginForm += "<label for='username'>用户名：</label>";
+        loginForm += "<input type='text' id='username' name='username'><br><br>";
+        loginForm += "<label for='password'>密码：</label>";
+        loginForm += "<input type='password' id='password' name='password'><br><br>";
+        loginForm += "<button type='submit'>登录</button>";
+        loginForm += "</form></body></html>";
+        server.send(200, "text/html; charset=UTF-8", loginForm);
+    }
+}
+
+void updateDisplay() {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(WHITE);
+    display.setCursor(0, 0);
+    display.println(ipAddressString);
+    if (currentPage == 0) {
+        for (int i = 0; i < 6; i++) {
+            display.println(lastOutputStates[i]);
+        }
+    } else if (currentPage == 1) {
+        for (int i = 6; i < 9; i++) {
+            display.println(lastOutputStates[i]);
+        }
+    }
+    display.display();
+    Serial.println("显示已更新"); // 调试信息
+}
+
+void loop() {
+    // 读取清除配置按键的当前状态
+    buttonState = digitalRead(clearConfigButtonPin);
+
+    // 检测按键是否按下（从高电平变为低电平），并且做简单防抖处理（可根据实际优化更精确的防抖逻辑）
+    if (buttonState == LOW && lastButtonState == HIGH) {
+        delay(10);  // 短暂延迟防抖
+        if (digitalRead(clearConfigButtonPin) == LOW) {
+            WiFiManager wm;
+            wm.resetSettings();
+            Serial.println("已清除WiFi配置信息，等待重新配置");
+            // 在OLED显示屏上显示提示信息告知用户
+            display.clearDisplay();
+            display.setTextSize(1);
+            display.setTextColor(WHITE);
+            display.setCursor(0, 0);
+            display.println("WiFi配置已清除，请重新配置");
+            display.display();
+            // 等待一段时间，避免频繁触发（可根据实际调整等待时间）
+            delay(2000);
+        }
+    }
+    lastButtonState = buttonState;
+
+    // 检查WiFi状态，如果断开尝试重新连接
+    if (WiFi.status()!= WL_CONNECTED) {
+        Serial.println("WiFi已断开，正在尝试重新连接...");
+        WiFiManager wm;
+        // 尝试自动连接，如果失败则进入配置模式
+        if (!wm.autoConnect("AutoConnectAP")) {
+        Serial.println("重新连接失败，进入配置模式...");
+        // 可以添加更多错误处理逻辑，比如显示错误提示在OLED等
+        delay(3000);
+        ESP.restart();
+    }
+    while (WiFi.status()!= WL_CONNECTED) {
+        delay(5000);
+        Serial.print(".");
+    }
+    Serial.println("WiFi已重新连接");
+    // 更新 IP 地址字符串
+    ipAddressString = "IP: " + WiFi.localIP().toString();
+    Serial.println(ipAddressString);
+    }
+
+    for (int i = 0; i < 9; i++) {
+        bool currentOutputStateValue = digitalRead(outputPins[i]);
+        String currentOutputState = currentOutputStateValue? "Output: ON" : "Output: OFF";
+        if (currentOutputState!= lastOutputStates[i]) {
+            lastOutputStates[i] = currentOutputState;
+            Serial.printf("引脚 %d 状态已更改为 %s\n", i, currentOutputState.c_str()); // 调试信息
+        }
+    }
+
+    displayUpdateCounter++;
+    if (displayUpdateCounter >= displayUpdateInterval) {
+        // 检查 IP 地址是否变化
+        if (ipAddressString!= lastIPAddress) {
+            updateDisplay();
+            lastIPAddress = ipAddressString;
+        } else {
+            updateDisplay(); // 强制更新显示
+        }
+        displayUpdateCounter = 0;
+    }
+
+    // 每 5 秒翻页一次
+    unsigned long currentTime = millis();
+    if (currentTime - lastPageFlipTime >= pageFlipInterval) {
+        currentPage = (currentPage + 1) % totalPages;
+        lastPageFlipTime = currentTime;
+        updateDisplay();
+    }
+
+    server.handleClient();
+}
