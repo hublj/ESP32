@@ -221,7 +221,7 @@ void loop() {
         if (digitalRead(clearConfigButtonPin) == LOW) {
             WiFiManager wm;
             wm.resetSettings();
-            Serial.println("The WiFi configuration has been cleared, please reconfigure");
+            Serial.println("已清除WiFi配置信息，等待重新配置");
             // 在OLED显示屏上显示提示信息告知用户
             display.clearDisplay();
             display.setTextSize(1);
