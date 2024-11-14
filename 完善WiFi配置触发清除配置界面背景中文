@@ -304,7 +304,7 @@ void loop() {
             display.setTextSize(1);
             display.setTextColor(WHITE);
             display.setCursor(0, 0);
-            display.println("WiFi配置已清除，请重新配置");
+            display.println("The WiFi configuration information has been cleared and is waiting for it to be reconfigured");
             display.display();
             // 等待一段时间，避免频繁触发（可根据实际调整等待时间）
             delay(2000);
